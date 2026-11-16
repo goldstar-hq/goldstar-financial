@@ -256,6 +256,17 @@ export default {
         } catch (_) {
           return err("Existing Owner Doctrine record is unreadable; refusing overwrite", 503);
         }
+        if (previous) {
+          if (previous.document_id !== "OWNER_DOCTRINE_V1" ||
+              Number(previous.record_version) > Number(payload.record_version)) {
+            return err("A newer or conflicting Owner Doctrine receipt already exists; refusing downgrade", 409);
+          }
+          if (Number(previous.record_version) === Number(payload.record_version) &&
+              previous.revision === payload.revision &&
+              previous.body_sha256 !== bodyHash) {
+            return err("Conflicting content for the same Owner Doctrine version; refusing overwrite", 409);
+          }
+        }
         if (previous && previous.body_sha256 === bodyHash &&
             previous.revision === payload.revision &&
             previous.record_version === payload.record_version) {
