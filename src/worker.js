@@ -157,11 +157,15 @@ function extractJSON(t) {
 export async function ai(env, prompt) {
   try {
     const doctrine = await loadOwnerDoctrine(env);
-    const ownerContext =
-      "MANDATORY GOLDSTAR L0 OWNER DOCTRINE. Apply this hierarchy and owner instruction before performing the requested analysis. " +
-      "Do not override it with assumptions or domain preferences. If the task conflicts with it, stop and explain the conflict.\\n" +
-      JSON.stringify(doctrine.body) +
-      "\\nEND MANDATORY OWNER DOCTRINE.\\n\\nTASK:\\n" + String(prompt || "");
+    const ownerContext = [
+      "MANDATORY GOLDSTAR L0 OWNER DOCTRINE. Apply this hierarchy and owner instruction before performing the requested analysis.",
+      "Do not override it with assumptions or domain preferences. If the task conflicts with it, stop and explain the conflict.",
+      JSON.stringify(doctrine.body),
+      "END MANDATORY OWNER DOCTRINE.",
+      "",
+      "TASK:",
+      String(prompt || "")
+    ].join("\n");
     var r = await env.AI.run(AI_MODEL, { prompt: ownerContext, max_tokens: 1024 });
     if (r && r.response) return r.response;
     if (r && r.choices && r.choices[0] && r.choices[0].text) return r.choices[0].text;
