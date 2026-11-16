@@ -33,6 +33,104 @@ async function body(req) {
     throw new Error("JSON invalid");
   }
 }
+const OWNER_DOCTRINE_KV_KEY = "governance:owner-doctrine:OWNER_DOCTRINE_V1";
+const MAX_OWNER_DOCTRINE_BYTES = 65536;
+
+export async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(String(value));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+async function readLimitedText(request, maxBytes) {
+  const declared = request.headers.get("Content-Length");
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maxBytes)) {
+    throw new Error("OWNER_DOCTRINE_PAYLOAD_TOO_LARGE");
+  }
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      total += part.value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error("OWNER_DOCTRINE_PAYLOAD_TOO_LARGE");
+      }
+      chunks.push(part.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+export async function validateOwnerDoctrinePayload(payload) {
+  if (!isRecord(payload) ||
+      payload.document_id !== "OWNER_DOCTRINE_V1" ||
+      payload.record_version !== 2 ||
+      payload.revision !== "1.1.0" ||
+      payload.owner_authority !== "L0_HUMAN_OWNER_FINAL_AUTHORITY" ||
+      !["production_pending_integration", "production_active"].includes(payload.status) ||
+      !isRecord(payload.body)) {
+    throw new Error("OWNER_DOCTRINE_CONTRACT_INVALID");
+  }
+  const body = payload.body;
+  if (body.document_id !== "OWNER_DOCTRINE_V1" ||
+      body.revision !== "1.1.0" ||
+      body.authority?.owner_level !== "L0" ||
+      body.identity_and_readers?.l1?.must_read_and_apply !== true ||
+      body.identity_and_readers?.all_managers_and_agents?.must_read_before_assignment !== true ||
+      body.identity_and_readers?.all_managers_and_agents?.must_follow_owner_hierarchy !== true) {
+    throw new Error("OWNER_DOCTRINE_BODY_INVALID");
+  }
+  const effective = body.lifecycle?.production_effective;
+  if ((payload.status === "production_pending_integration" && effective !== false) ||
+      (payload.status === "production_active" && effective !== true)) {
+    throw new Error("OWNER_DOCTRINE_LIFECYCLE_MISMATCH");
+  }
+  const calculated = await sha256Hex(JSON.stringify(body));
+  if (typeof payload.body_sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(payload.body_sha256) ||
+      calculated !== payload.body_sha256) {
+    throw new Error("OWNER_DOCTRINE_HASH_MISMATCH");
+  }
+  return calculated;
+}
+
+export async function loadOwnerDoctrine(env) {
+  if (!env.KNOWLEDGE || typeof env.KNOWLEDGE.get !== "function") {
+    throw new Error("OWNER_DOCTRINE_STORE_UNAVAILABLE");
+  }
+  const raw = await env.KNOWLEDGE.get(OWNER_DOCTRINE_KV_KEY);
+  if (typeof raw !== "string" || !raw) {
+    throw new Error("OWNER_DOCTRINE_NOT_RECEIVED");
+  }
+  let stored;
+  try { stored = JSON.parse(raw); }
+  catch (_) { throw new Error("OWNER_DOCTRINE_STORAGE_INVALID"); }
+  await validateOwnerDoctrinePayload(stored);
+  if (typeof stored.received_at !== "string" || !stored.received_at ||
+      stored.recipient_agent_id !== "L2" ||
+      stored.recipient_worker !== "goldstar-financial-v3") {
+    throw new Error("OWNER_DOCTRINE_RECEIPT_INVALID");
+  }
+  return stored;
+}
+
 function extractJSON(t) {
   if (!t) return null;
   try { return JSON.parse(t); } catch (e) {}
@@ -56,9 +154,15 @@ function extractJSON(t) {
   }
   return null;
 }
-async function ai(env, prompt) {
+export async function ai(env, prompt) {
   try {
-    var r = await env.AI.run(AI_MODEL, { prompt: prompt, max_tokens: 1024 });
+    const doctrine = await loadOwnerDoctrine(env);
+    const ownerContext =
+      "MANDATORY GOLDSTAR L0 OWNER DOCTRINE. Apply this hierarchy and owner instruction before performing the requested analysis. " +
+      "Do not override it with assumptions or domain preferences. If the task conflicts with it, stop and explain the conflict.\\n" +
+      JSON.stringify(doctrine.body) +
+      "\\nEND MANDATORY OWNER DOCTRINE.\\n\\nTASK:\\n" + String(prompt || "");
+    var r = await env.AI.run(AI_MODEL, { prompt: ownerContext, max_tokens: 1024 });
     if (r && r.response) return r.response;
     if (r && r.choices && r.choices[0] && r.choices[0].text) return r.choices[0].text;
     if (typeof r === "string") return r;
@@ -97,6 +201,106 @@ export default {
         var validBridge = !!(bridgeKey && env.L1_BRIDGE_KEY && bridgeKey === env.L1_BRIDGE_KEY);
         var validLegacy = !!(legacyKey && env.API_KEY && legacyKey === env.API_KEY);
         if (!validBridge && !validLegacy) return err("Auth required", 401);
+      }
+
+      if (path === "/governance/owner-doctrine" || path === "/governance/owner-doctrine/status") {
+        if (!validBridge) return err("Dedicated L1 bridge authentication is required", 401);
+        if (!env.KNOWLEDGE || typeof env.KNOWLEDGE.get !== "function" ||
+            typeof env.KNOWLEDGE.put !== "function") return err("Owner Doctrine store is unavailable", 503);
+
+        if (path === "/governance/owner-doctrine/status") {
+          if (method !== "GET") return err("GET required", 405);
+          try {
+            const stored = await loadOwnerDoctrine(env);
+            return ok({
+              received: true,
+              document_id: stored.document_id,
+              record_version: stored.record_version,
+              revision: stored.revision,
+              status: stored.status,
+              body_sha256: stored.body_sha256,
+              received_at: stored.received_at,
+              recipient_agent_id: stored.recipient_agent_id,
+              recipient_worker: stored.recipient_worker
+            });
+          } catch (error) {
+            if (String(error.message || error) === "OWNER_DOCTRINE_NOT_RECEIVED") {
+              return ok({ received: false, status: "not_received" });
+            }
+            return err("Stored Owner Doctrine failed integrity validation", 503);
+          }
+        }
+
+        if (method !== "POST") return err("POST required", 405);
+        if ((request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase() !== "application/json") {
+          return err("Content-Type must be application/json", 415);
+        }
+        let payload;
+        try {
+          const rawPayload = await readLimitedText(request, MAX_OWNER_DOCTRINE_BYTES);
+          payload = JSON.parse(rawPayload);
+        } catch (error) {
+          const message = String(error.message || error);
+          return err(message === "OWNER_DOCTRINE_PAYLOAD_TOO_LARGE" ? message : "Invalid Owner Doctrine JSON payload",
+            message === "OWNER_DOCTRINE_PAYLOAD_TOO_LARGE" ? 413 : 400);
+        }
+
+        let bodyHash;
+        try { bodyHash = await validateOwnerDoctrinePayload(payload); }
+        catch (error) { return err(String(error.message || "Owner Doctrine validation failed"), 400); }
+
+        let previous = null;
+        try {
+          const previousRaw = await env.KNOWLEDGE.get(OWNER_DOCTRINE_KV_KEY);
+          previous = previousRaw ? JSON.parse(previousRaw) : null;
+        } catch (_) {
+          return err("Existing Owner Doctrine record is unreadable; refusing overwrite", 503);
+        }
+        if (previous && previous.body_sha256 === bodyHash &&
+            previous.revision === payload.revision &&
+            previous.record_version === payload.record_version) {
+          try {
+            await loadOwnerDoctrine(env);
+            return ok({
+              received: true, already_received: true,
+              document_id: previous.document_id, record_version: previous.record_version,
+              revision: previous.revision, status: previous.status,
+              body_sha256: previous.body_sha256, received_at: previous.received_at,
+              recipient_agent_id: previous.recipient_agent_id,
+              recipient_worker: previous.recipient_worker
+            });
+          } catch (_) {
+            return err("Existing Owner Doctrine record failed integrity validation", 503);
+          }
+        }
+
+        const received = {
+          document_id: payload.document_id,
+          record_version: payload.record_version,
+          revision: payload.revision,
+          status: payload.status,
+          owner_authority: payload.owner_authority,
+          body: payload.body,
+          body_sha256: bodyHash,
+          received_at: new Date().toISOString(),
+          recipient_agent_id: "L2",
+          recipient_worker: "goldstar-financial-v3",
+          receipt_version: 1
+        };
+        try {
+          await env.KNOWLEDGE.put(OWNER_DOCTRINE_KV_KEY, JSON.stringify(received));
+          const verified = await loadOwnerDoctrine(env);
+          return ok({
+            received: true, already_received: false,
+            document_id: verified.document_id, record_version: verified.record_version,
+            revision: verified.revision, status: verified.status,
+            body_sha256: verified.body_sha256, received_at: verified.received_at,
+            recipient_agent_id: verified.recipient_agent_id,
+            recipient_worker: verified.recipient_worker
+          });
+        } catch (_) {
+          return err("Owner Doctrine persistence or read-back verification failed", 503);
+        }
       }
 
       if (path === "/health") return ok({ status: "ok", version: "3.0.1", analysisEnabled: MARKET_ANALYSIS_ENABLED });
