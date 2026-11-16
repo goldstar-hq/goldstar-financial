@@ -4,6 +4,7 @@ on:
     branches:
       - fix/mql5-gateway-client-auth
       - fix/l2-mql5-marketdata-proxy
+      - feat/owner-doctrine-l2-receive-2026-11-16
   pull_request:
     branches:
       - main
