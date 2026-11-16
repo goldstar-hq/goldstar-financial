@@ -147,6 +147,34 @@ test("Owner Doctrine receipt is idempotent and status exposes metadata, not the 
   assert.equal(Object.hasOwn(statusResult, "body"), false);
 });
 
+test("L2 refuses conflicting content for an already received Owner Doctrine version", async () => {
+  const env = makeEnv();
+  const original = await validPayload();
+  const first = await worker.fetch(
+    request("/governance/owner-doctrine", "POST", original, bridge), env, {}
+  );
+  assert.equal(first.status, 200);
+
+  const changedBody = doctrineBody({
+    owner_working_profile: {
+      communication: "Different text for the same version.",
+      test_directive: "CONFLICTING_CONTENT"
+    }
+  });
+  const conflicting = {
+    ...original,
+    body: changedBody,
+    body_sha256: await sha256Hex(JSON.stringify(changedBody))
+  };
+  const second = await worker.fetch(
+    request("/governance/owner-doctrine", "POST", conflicting, bridge), env, {}
+  );
+  assert.equal(second.status, 409);
+  assert.match((await second.json()).error, /Conflicting content/);
+  const stored = JSON.parse(await env.KNOWLEDGE.get("governance:owner-doctrine:OWNER_DOCTRINE_V1"));
+  assert.equal(stored.body.owner_working_profile.test_directive, "OWNER_DIRECTIVE_FOR_TEST");
+});
+
 test("L2 rejects an Owner Doctrine with a mismatched body hash", async () => {
   const env = makeEnv();
   const payload = await validPayload({ body_sha256: "0".repeat(64) });
